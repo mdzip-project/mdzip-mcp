@@ -1,0 +1,46 @@
+{
+  "name": "@mdzip/mcp-server",
+  "version": "0.1.0",
+  "description": "Standalone MCP server that lets AI tools read, search and edit MDZip (.mdz) documents.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mdzip-project/mdzip-mcp"
+  },
+  "bugs": {
+    "url": "https://github.com/mdzip-project/mdzip-mcp/issues"
+  },
+  "homepage": "https://github.com/mdzip-project/mdzip-mcp#readme",
+  "keywords": [
+    "mdzip",
+    "mdz",
+    "markdown",
+    "mcp",
+    "model-context-protocol"
+  ],
+  "bin": {
+    "mdzip-mcp-server": "dist/mdzip-mcp-server.js"
+  },
+  "files": [
+    "dist/mdzip-mcp-server.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "esbuild src/mdzMcpServer.ts --bundle --outfile=dist/mdzip-mcp-server.js --format=cjs --platform=node --target=node20 --minify --loader:.md=text --banner:js=\"#!/usr/bin/env node\"",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node tests/mcp-smoke.cjs",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@mdzip/core-js": "^2.2.1",
+    "@modelcontextprotocol/sdk": "^1.17.4",
+    "@types/node": "^20.19.39",
+    "esbuild": "^0.28.0",
+    "fflate": "^0.8.3",
+    "typescript": "^5.9.3"
+  }
+}

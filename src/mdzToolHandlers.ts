@@ -1,0 +1,1678 @@
+import { promises as fs } from 'fs';
+import * as path from 'path';
+import { createHash } from 'crypto';
+import { MdzArchiveCore, MdzPackagerCore, MDZ_IMAGE_MIME_TYPES, samePath, type MdzPackInputFile } from '@mdzip/core-js';
+import agentsGuideText from '../media/templates/embedded-agent-guide.md';
+
+/**
+ * Shared business logic behind every mdz_ and upsert_canonical_document tool. This module is
+ * imported by both `mdzMcpServer.ts` (the external stdio MCP server, for agents that only
+ * speak MCP — Claude Code, Codex) and `mdzLanguageModelTools.ts` (native VS Code
+ * `vscode.lm.registerTool` tools, for in-editor chat participants like Copilot Chat) so the
+ * two integration paths can never drift apart. It must stay free of any `vscode` import —
+ * the MCP server bundle runs as a plain Node process with no VS Code API available.
+ */
+
+export type ToolArgs = Record<string, unknown> | undefined;
+type EntryPointSource = 'requested' | 'manifest' | 'fallback-single-markdown';
+export type ToolContent = { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string };
+export type ToolResult = {
+  content: ToolContent[];
+  isError?: boolean;
+};
+
+type SchemaProperty = {
+  type: string;
+  description?: string;
+  enum?: string[];
+  items?: SchemaProperty;
+  properties?: Record<string, SchemaProperty>;
+  required?: string[];
+};
+
+export type ToolDefinition = {
+  name: string;
+  description: string;
+  inputSchema: {
+    type: 'object';
+    properties: Record<string, SchemaProperty>;
+    required: string[];
+  };
+};
+
+type ToolErrorPayload = {
+  code: string;
+  message: string;
+  nextAction: string;
+  candidatePaths?: string[];
+};
+
+type SearchMatch = {
+  path: string;
+  lineNumber: number;
+  columnNumber: number;
+  snippet: string;
+};
+
+type ResolveContext = {
+  requestedEntryPath: string | null;
+  resolvedMarkdownPath: string;
+  canonicalEntrypointPath: string | null;
+  entrypointSource: EntryPointSource;
+  isCanonicalRead: boolean;
+  isAmbiguous: boolean;
+  recommendedNextAction: string;
+};
+
+type ReferencedImage = {
+  path: string;
+  mimeType: string;
+  bytes: Uint8Array;
+  alt: string;
+};
+
+export class MdzToolError extends Error {
+  public readonly payload: ToolErrorPayload;
+
+  public constructor(payload: ToolErrorPayload) {
+    super(payload.message);
+    this.payload = payload;
+  }
+}
+
+const CREATE_ARCHIVE_DESCRIPTION =
+  'Create a new .mdz file: use this to start an MDZip document from scratch. Don\'t build an .mdz yourself with zip tools or a script (Python, PowerShell, zip); a hand-made archive can miss the manifest and other format rules, and nothing checks it. Pass every file in files (the Markdown documents plus any images, diagrams, stylesheets or data), with title, mode and entryPoint for the manifest. The archive is built in memory, validated, and written once; nothing is written if validation finds errors. Fails with ARCHIVE_EXISTS if archivePath is taken, unless overwrite is true. Adds the standard AGENTS.md unless includeAgentsGuide is false. Returns the entry point, each file\'s entryHash (pass it to mdz_write_entry or mdz_remove_entry to change that file later) and validation results, including images nothing references and references that don\'t resolve.';
+
+export const TOOL_DEFINITIONS: ToolDefinition[] = [
+  {
+    name: 'mdz_review_document',
+    description:
+      'Preferred first call for review/analyze/summarize requests on an .mdz file. Returns markdown text and referenced images plus canonical/entrypoint resolution metadata, including canonicalContentHash — pass that back as expectedContentHash to upsert_canonical_document to guard against overwriting edits made elsewhere (e.g. in the VS Code editor) since this read.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        archivePath: {
+          type: 'string',
+          description: 'Absolute or workspace-relative path to the .mdz file.',
+        },
+        entryPath: {
+          type: 'string',
+          description:
+            'Optional archive-relative markdown path. When omitted, the server resolves manifest-first canonical markdown.',
+        },
+        maxImages: {
+          type: 'number',
+          description:
+            'Optional cap for returned images to control payload size. Defaults to 12 and is clamped to 1..50.',
+        },
+      },
+      required: ['archivePath'],
+    },
+  },
+  {
+    name: 'upsert_canonical_document',
+    description:
+      'Preferred write path for markdown updates. Updates manifest-first canonical markdown and returns changed paths plus post-write validation. Requires expectedContentHash (from a prior mdz_review_document call) and fails with a CONTENT_CONFLICT error instead of overwriting if the on-disk canonical content has changed since that read.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        archivePath: {
+          type: 'string',
+          description: 'Absolute or workspace-relative path to the .mdz file.',
+        },
+        content: {
+          type: 'string',
+          description: 'New markdown content for the canonical entrypoint document.',
+        },
+        expectedContentHash: {
+          type: 'string',
+          description:
+            'The canonicalContentHash returned by the most recent mdz_review_document call for this archive. The write is rejected with CONTENT_CONFLICT if the current on-disk hash no longer matches, which means the document changed since it was last read (e.g. saved from the VS Code editor).',
+        },
+      },
+      required: ['archivePath', 'content', 'expectedContentHash'],
+    },
+  },
+  {
+    name: 'mdz_create_archive',
+    description: CREATE_ARCHIVE_DESCRIPTION,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        archivePath: {
+          type: 'string',
+          description: 'Absolute or workspace-relative path of the new .mdz file. Missing parent folders are created.',
+        },
+        files: {
+          type: 'array',
+          description:
+            'Every file to put in the archive: at least one Markdown document, plus any images, diagrams (.svg, .drawio), stylesheets or data files. Give each file\'s content as exactly one of content, sourcePath or contentBase64. Don\'t include manifest.json; set title, mode and entryPoint instead.',
+          items: {
+            type: 'object',
+            properties: {
+              path: {
+                type: 'string',
+                description: 'Archive-relative path, for example index.md, chapters/02-setup.md or images/chart.png. Case-sensitive.',
+              },
+              content: {
+                type: 'string',
+                description: 'The file as UTF-8 text (Markdown, SVG, .drawio, CSS, JSON, CSV, ...). Markdown line endings are normalized to LF.',
+              },
+              sourcePath: {
+                type: 'string',
+                description: 'Absolute or workspace-relative path of a file on disk to copy in, for example an image you generated.',
+              },
+              contentBase64: {
+                type: 'string',
+                description: 'The file as base64, for binary content passed inline.',
+              },
+            },
+            required: ['path'],
+          },
+        },
+        title: {
+          type: 'string',
+          description: 'Document title for the manifest. Defaults to the main document\'s first # heading, then the file name.',
+        },
+        mode: {
+          type: 'string',
+          enum: ['document', 'project'],
+          description:
+            '"document" (default): one document, possibly split across several Markdown files (chapters, sections). "project": several separate documents that link to each other.',
+        },
+        entryPoint: {
+          type: 'string',
+          description:
+            'Path of the main Markdown document, which opens first. Optional when there is only one Markdown file or one is named index.md.',
+        },
+        description: {
+          type: 'string',
+          description: 'Optional one-sentence description for the manifest.',
+        },
+        author: {
+          type: 'string',
+          description: 'Optional author name for the manifest.',
+        },
+        language: {
+          type: 'string',
+          description: 'Optional language tag for the manifest, for example en or en-US.',
+        },
+        overwrite: {
+          type: 'boolean',
+          description: 'Replace archivePath if it already exists. Defaults to false. Only set it when the user asked to replace that file.',
+        },
+        includeAgentsGuide: {
+          type: 'boolean',
+          description:
+            'Add the standard AGENTS.md that tells AI tools without MDZip support how to read and edit the archive safely. Defaults to true. Ignored if files already has an AGENTS.md.',
+        },
+      },
+      required: ['archivePath', 'files'],
+    },
+  },
+  {
+    name: 'mdz_write_entry',
+    description:
+      'Add or replace any file inside an .mdz archive: another Markdown document, an image, a diagram (.svg, .drawio), a stylesheet, a data file, an AGENTS.md. Give the content as exactly one of content (UTF-8 text), sourcePath (a file on disk, for images or diagrams you just generated) or contentBase64 (other binary). Every other file in the archive is kept byte-for-byte. Replacing an existing file requires expectedEntryHash (from mdz_read_text, mdz_read_image or mdz_list_entries with includeHashes) and fails with CONTENT_CONFLICT if the file changed since; omit it to add a new file, which fails with ENTRY_EXISTS if the path is taken. manifest.json can\'t be written here. For the main document, upsert_canonical_document also works. Returns the changed paths, the new entry hash and post-write validation, including images that nothing references and references that don\'t resolve.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        archivePath: {
+          type: 'string',
+          description: 'Absolute or workspace-relative path to the .mdz file.',
+        },
+        entryPath: {
+          type: 'string',
+          description: 'Archive-relative path of the file to add or replace, for example images/chart.png or chapters/02-setup.md. Case-sensitive.',
+        },
+        content: {
+          type: 'string',
+          description: 'The file as UTF-8 text (Markdown, SVG, .drawio, CSS, JSON, CSV, ...). Markdown line endings are normalized to LF.',
+        },
+        sourcePath: {
+          type: 'string',
+          description: 'Absolute or workspace-relative path of a file on disk to copy into the archive, for example an image you generated.',
+        },
+        contentBase64: {
+          type: 'string',
+          description: 'The file as base64, for binary content passed inline.',
+        },
+        expectedEntryHash: {
+          type: 'string',
+          description: 'Required to replace an existing file: its entryHash from your last read. Omit when adding a new file.',
+        },
+      },
+      required: ['archivePath', 'entryPath'],
+    },
+  },
+  {
+    name: 'mdz_remove_entry',
+    description:
+      'Remove a file from an .mdz archive, keeping every other file byte-for-byte. Requires expectedEntryHash (from mdz_read_text, mdz_read_image or mdz_list_entries with includeHashes) and fails with CONTENT_CONFLICT if the file changed since. manifest.json and the archive\'s entry point can\'t be removed. Returns the changed paths and post-write validation; check unresolvedReferences for links or images that pointed at the removed file.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        archivePath: {
+          type: 'string',
+          description: 'Absolute or workspace-relative path to the .mdz file.',
+        },
+        entryPath: {
+          type: 'string',
+          description: 'Archive-relative path of the file to remove. Case-sensitive.',
+        },
+        expectedEntryHash: {
+          type: 'string',
+          description: 'The file\'s entryHash from your last read.',
+        },
+      },
+      required: ['archivePath', 'entryPath', 'expectedEntryHash'],
+    },
+  },
+  {
+    name: 'mdz_list_entries',
+    description:
+      'List all non-directory entries inside an .mdz archive. Advanced inspection tool; start with mdz_review_document for default agent workflows. Set includeHashes to get each entry\'s entryHash, needed to replace or remove it with mdz_write_entry or mdz_remove_entry.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        archivePath: {
+          type: 'string',
+          description: 'Absolute or workspace-relative path to the .mdz file.',
+        },
+        includeHashes: {
+          type: 'boolean',
+          description: 'Also return each entry\'s size and entryHash. Reads every entry, so it\'s slower on large archives. Defaults to false.',
+        },
+      },
+      required: ['archivePath'],
+    },
+  },
+  {
+    name: 'mdz_search_text',
+    description:
+      'Search UTF-8 text entries inside an .mdz archive. Use this directly for grep/find/search requests instead of asking whether to inspect the archive another way.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        archivePath: {
+          type: 'string',
+          description: 'Absolute or workspace-relative path to the .mdz file.',
+        },
+        query: {
+          type: 'string',
+          description: 'Text or regular expression to search for inside archive text entries.',
+        },
+        caseSensitive: {
+          type: 'boolean',
+          description: 'Whether matching is case-sensitive. Defaults to false.',
+        },
+        regex: {
+          type: 'boolean',
+          description: 'Interpret query as a JavaScript regular expression. Defaults to false.',
+        },
+        maxResults: {
+          type: 'number',
+          description: 'Maximum number of matching lines to return. Defaults to 100 and is clamped to 1..1000.',
+        },
+      },
+      required: ['archivePath', 'query'],
+    },
+  },
+  {
+    name: 'mdz_read_text',
+    description:
+      'Read a UTF-8 text entry from an .mdz archive by archive-relative path. Advanced inspection tool; prefer mdz_review_document for first read.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        archivePath: {
+          type: 'string',
+          description: 'Absolute or workspace-relative path to the .mdz file.',
+        },
+        entryPath: {
+          type: 'string',
+          description: 'Archive-relative path (for example: manifest.json or index.md).',
+        },
+      },
+      required: ['archivePath', 'entryPath'],
+    },
+  },
+  {
+    name: 'mdz_read_image',
+    description:
+      'Read an image entry from an .mdz archive and return it directly as image content (no extraction required). Advanced inspection tool.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        archivePath: {
+          type: 'string',
+          description: 'Absolute or workspace-relative path to the .mdz file.',
+        },
+        entryPath: {
+          type: 'string',
+          description: 'Archive-relative image path (for example: images/diagram.png).',
+        },
+      },
+      required: ['archivePath', 'entryPath'],
+    },
+  },
+  {
+    name: 'mdz_read_markdown_embedded_images',
+    description:
+      'Read markdown from an .mdz entry and embed archive images as data URLs directly in the markdown text. Prefer mdz_review_document for general review tasks.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        archivePath: {
+          type: 'string',
+          description: 'Absolute or workspace-relative path to the .mdz file.',
+        },
+        entryPath: {
+          type: 'string',
+          description:
+            'Optional archive-relative markdown path. When omitted, the server resolves manifest-first canonical markdown.',
+        },
+      },
+      required: ['archivePath'],
+    },
+  },
+];
+
+export async function handleToolCall(name: string, args: ToolArgs): Promise<ToolResult> {
+  switch (name) {
+    case 'mdz_review_document': {
+      const archivePath = stringArg(args, 'archivePath');
+      const bytes = await readArchiveBytes(archivePath);
+      const archive = await MdzArchiveCore.open(bytes);
+
+      const requestedEntryPath = optionalStringArg(args, 'entryPath');
+      const context = await resolveReadContext(archive, requestedEntryPath);
+      if (!archive.hasEntry(context.resolvedMarkdownPath)) {
+        throw toolError(
+          'ENTRY_NOT_FOUND',
+          `Markdown entry not found: ${context.resolvedMarkdownPath}`,
+          'Call mdz_list_entries to inspect archive paths, then retry mdz_review_document with a valid markdown entry path.',
+          listMarkdownPaths(archive)
+        );
+      }
+
+      const markdown = await archive.readText(context.resolvedMarkdownPath);
+      // Hash of the *canonical* entrypoint specifically (not just whatever was
+      // requested) — this is what upsert_canonical_document actually writes to,
+      // so it's the value callers must round-trip as expectedContentHash.
+      const canonicalContentHash = context.canonicalEntrypointPath
+        ? hashText(
+            context.canonicalEntrypointPath === context.resolvedMarkdownPath
+              ? markdown
+              : await archive.readText(context.canonicalEntrypointPath)
+          )
+        : null;
+      const maxImages = clampInteger(optionalNumberArg(args, 'maxImages') ?? 12, 1, 50);
+      const referencedImages = await collectReferencedImages(
+        archive,
+        context.resolvedMarkdownPath,
+        markdown,
+        maxImages
+      );
+
+      const imageSummary = referencedImages.map((image) => ({
+        path: image.path,
+        mimeType: image.mimeType,
+        bytes: image.bytes.byteLength,
+        altText: image.alt,
+      }));
+
+      const content: ToolContent[] = [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              archivePath,
+              requestedEntryPath: context.requestedEntryPath,
+              resolvedMarkdownPath: context.resolvedMarkdownPath,
+              canonicalEntrypointPath: context.canonicalEntrypointPath,
+              canonicalContentHash,
+              entrypointSource: context.entrypointSource,
+              isCanonicalRead: context.isCanonicalRead,
+              isAmbiguous: context.isAmbiguous,
+              recommendedNextAction: context.recommendedNextAction,
+              imageCount: referencedImages.length,
+              maxImages,
+              images: imageSummary,
+            },
+            null,
+            2
+          ),
+        },
+        {
+          type: 'text',
+          text: markdown,
+        },
+      ];
+
+      for (const image of referencedImages) {
+        content.push({
+          type: 'image',
+          data: Buffer.from(image.bytes).toString('base64'),
+          mimeType: image.mimeType,
+        });
+      }
+
+      return { content };
+    }
+
+    case 'upsert_canonical_document': {
+      const archivePath = stringArg(args, 'archivePath');
+      const content = stringArg(args, 'content');
+      const expectedContentHash = optionalStringArg(args, 'expectedContentHash');
+
+      const bytes = await readArchiveBytes(archivePath);
+      const archive = await MdzArchiveCore.open(bytes);
+      const canonicalEntrypointPath = await resolveCanonicalEntrypointForWrite(archive);
+
+      // Optimistic-concurrency guard: refuse to overwrite if the on-disk
+      // canonical content no longer matches what the caller last read via
+      // mdz_review_document. Without this, a write here silently clobbers
+      // any edit made elsewhere (e.g. saved from the VS Code editor) between
+      // that read and this write.
+      const currentContent = await archive.readText(canonicalEntrypointPath);
+      const currentContentHash = hashText(currentContent);
+      if (!expectedContentHash) {
+        throw toolError(
+          'MISSING_EXPECTED_CONTENT_HASH',
+          'expectedContentHash is required to write the canonical document.',
+          `Call mdz_review_document to read the current canonical content, then retry upsert_canonical_document with expectedContentHash set to its canonicalContentHash (currently ${currentContentHash}).`
+        );
+      }
+      if (currentContentHash !== expectedContentHash) {
+        throw toolError(
+          'CONTENT_CONFLICT',
+          `The canonical document (${canonicalEntrypointPath}) has changed since it was last read. Expected content hash ${expectedContentHash}, found ${currentContentHash}.`,
+          'Call mdz_review_document to re-read the current canonical content, reconcile your intended change against it, then retry upsert_canonical_document with the new canonicalContentHash as expectedContentHash.'
+        );
+      }
+
+      const mutation = await MdzArchiveCore.addFile(bytes, canonicalEntrypointPath, content);
+      const nextBytes = new Uint8Array(await mutation.blob.arrayBuffer());
+      await fs.writeFile(archivePath, nextBytes);
+
+      const validation = await MdzArchiveCore.validate(nextBytes);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                archivePath,
+                canonicalEntrypointPath,
+                changedPaths: [canonicalEntrypointPath],
+                postWriteValidation: {
+                  isValid: validation.isValid,
+                  errors: validation.errors,
+                  warnings: validation.warnings,
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+
+    case 'mdz_create_archive': {
+      const archivePath = stringArg(args, 'archivePath').trim();
+      if (path.extname(archivePath).toLowerCase() !== '.mdz') {
+        throw toolError(
+          'INVALID_ARCHIVE_PATH',
+          `${archivePath} doesn't end in .mdz.`,
+          'Retry mdz_create_archive with an archivePath ending in .mdz.'
+        );
+      }
+      const overwrite = optionalBooleanArg(args, 'overwrite') ?? false;
+      const existed = await pathExists(archivePath);
+      if (existed && !overwrite) {
+        throw archiveExistsError(archivePath);
+      }
+
+      const entries = await createArchiveFilesArg(args);
+      const markdownPaths = entries.map((entry) => entry.path).filter((p) => MdzArchiveCore.isMarkdownFile(p));
+      if (!markdownPaths.length) {
+        throw toolError(
+          'NO_MARKDOWN_ENTRIES',
+          'files has no Markdown document (.md).',
+          'Add the main document to files, for example {"path": "index.md", "content": "# Title\\n"}, and retry mdz_create_archive.'
+        );
+      }
+      const entryPoint = resolveCreateEntryPoint(optionalStringArg(args, 'entryPoint'), markdownPaths);
+
+      const modeArg = optionalStringArg(args, 'mode');
+      if (modeArg !== undefined && modeArg !== 'document' && modeArg !== 'project') {
+        throw toolError(
+          'INVALID_MODE',
+          `mode must be "document" or "project", not "${modeArg}".`,
+          'Retry mdz_create_archive with mode "document" (one document, possibly in several files) or "project" (separate linked documents), or leave it out.'
+        );
+      }
+      const mode = modeArg ?? 'document';
+      const hints: string[] = [];
+      if (!modeArg && markdownPaths.filter((p) => !isSupportMarkdown(p)).length > 1) {
+        hints.push(
+          'Several Markdown documents and no mode: written as mode "document" (one document split across files). If they are separate documents, recreate with mode "project" and overwrite true.'
+        );
+      }
+
+      const entryText = entries.find((entry) => entry.path === entryPoint)?.content;
+      const title =
+        optionalStringArg(args, 'title') ??
+        (typeof entryText === 'string' ? firstHeading(entryText) : undefined) ??
+        path.basename(archivePath, path.extname(archivePath));
+
+      let agentsGuide: 'added' | 'provided' | 'skipped' | 'unavailable';
+      if (entries.some((entry) => entry.path.toLowerCase() === 'agents.md')) {
+        agentsGuide = 'provided';
+      } else if (optionalBooleanArg(args, 'includeAgentsGuide') === false) {
+        agentsGuide = 'skipped';
+      } else {
+        const guide = await readAgentsGuide();
+        if (guide) {
+          entries.push({ path: 'AGENTS.md', content: guide });
+          agentsGuide = 'added';
+        } else {
+          agentsGuide = 'unavailable';
+        }
+      }
+
+      const packFiles: MdzPackInputFile[] = entries.map((entry) =>
+        typeof entry.content === 'string' ? { path: entry.path, text: entry.content } : { path: entry.path, data: entry.content }
+      );
+      const built = await mutateArchive(() =>
+        MdzPackagerCore.buildArchive(packFiles, title, {
+          createIndex: false,
+          mapFiles: false,
+          filters: ['**/*', '*'],
+          title,
+          mode,
+          entryPoint,
+          description: optionalStringArg(args, 'description') ?? null,
+          author: optionalStringArg(args, 'author') ?? null,
+          language: optionalStringArg(args, 'language') ?? null,
+        })
+      );
+      const skipped = Object.entries(built.warnings.skippedByReason ?? {});
+      if (skipped.length) {
+        throw toolError(
+          'FILES_SKIPPED',
+          `The archive wasn't written: some files would have been left out (${skipped.map(([reason, count]) => `${count} ${reason}`).join(', ')}).`,
+          'Check the paths in files (archive-relative, forward slashes, no ".."), then retry mdz_create_archive.'
+        );
+      }
+
+      const bytes = new Uint8Array(await built.blob.arrayBuffer());
+      const validation = await postWriteValidation(bytes);
+      if (!validation.isValid) {
+        throw toolError(
+          'ARCHIVE_INVALID',
+          `The archive wasn't written: validation found errors: ${JSON.stringify(validation.errors)}`,
+          'Fix what the errors name, then retry mdz_create_archive.'
+        );
+      }
+
+      await fs.mkdir(path.dirname(path.resolve(archivePath)), { recursive: true });
+      try {
+        await fs.writeFile(archivePath, bytes, { flag: overwrite ? 'w' : 'wx' });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+          throw archiveExistsError(archivePath);
+        }
+        throw error;
+      }
+
+      const written = await MdzArchiveCore.open(bytes);
+      const files = await Promise.all(
+        written
+          .listEntries()
+          .filter((entry) => !entry.isDirectory && !samePath(entry.path, 'manifest.json'))
+          .map(async (entry) => {
+            const entryBytes = await written.readBytes(entry.path);
+            return { path: entry.path, bytes: entryBytes.byteLength, entryHash: hashBytes(entryBytes) };
+          })
+      );
+
+      return jsonResult({
+        archivePath,
+        replaced: existed,
+        entryPoint: built.resolvedEntryPoint,
+        title,
+        mode,
+        agentsGuide,
+        files,
+        hints,
+        packagingWarnings: built.warnings.messages ?? [],
+        postWriteValidation: validation,
+      });
+    }
+
+    case 'mdz_write_entry': {
+      const archivePath = stringArg(args, 'archivePath');
+      const entryPath = writableEntryPath(stringArg(args, 'entryPath'), 'mdz_write_entry');
+      const expectedEntryHash = optionalStringArg(args, 'expectedEntryHash');
+      const newContent = await entryContentArg(args);
+
+      const bytes = await readArchiveBytes(archivePath);
+      const archive = await MdzArchiveCore.open(bytes);
+      const existingPath = findExistingPath(archive, entryPath);
+      const caseOnlyMatch = existingPath ? null : archive.findCaseOnlyMatch(entryPath);
+      if (caseOnlyMatch) {
+        throw toolError(
+          'ENTRY_PATH_CASE_MISMATCH',
+          `The archive has "${caseOnlyMatch}", which differs from "${entryPath}" only in case. Paths in an archive are case-sensitive, so writing would add a second file.`,
+          `Retry mdz_write_entry with entryPath "${caseOnlyMatch}" to replace that file, or choose a different name.`,
+          [caseOnlyMatch]
+        );
+      }
+      if (existingPath) {
+        await checkEntryHash(archive, existingPath, expectedEntryHash, 'mdz_write_entry');
+      } else if (expectedEntryHash) {
+        throw toolError(
+          'ENTRY_NOT_FOUND',
+          `Entry not found: ${entryPath}. expectedEntryHash was given, so a replacement was intended, but there is nothing to replace.`,
+          'Call mdz_list_entries to find the file you meant, or omit expectedEntryHash to add a new file at this path.'
+        );
+      }
+
+      const mutation = await mutateArchive(() =>
+        MdzArchiveCore.updateFiles(bytes, [{ path: entryPath, content: newContent }])
+      );
+      const nextBytes = new Uint8Array(await mutation.blob.arrayBuffer());
+      await fs.writeFile(archivePath, nextBytes);
+      const written = await (await MdzArchiveCore.open(nextBytes)).readBytes(entryPath);
+
+      return jsonResult({
+        archivePath,
+        entryPath,
+        created: !existingPath,
+        entryHash: hashBytes(written),
+        bytes: written.byteLength,
+        changedPaths: changedPathsOf(mutation, [entryPath]),
+        entryPoint: mutation.resolvedEntryPoint,
+        postWriteValidation: await postWriteValidation(nextBytes),
+      });
+    }
+
+    case 'mdz_remove_entry': {
+      const archivePath = stringArg(args, 'archivePath');
+      const entryPath = writableEntryPath(stringArg(args, 'entryPath'), 'mdz_remove_entry');
+      const expectedEntryHash = optionalStringArg(args, 'expectedEntryHash');
+
+      const bytes = await readArchiveBytes(archivePath);
+      const archive = await MdzArchiveCore.open(bytes);
+      const existingPath = findExistingPath(archive, entryPath);
+      if (!existingPath) {
+        const caseOnlyMatch = archive.findCaseOnlyMatch(entryPath);
+        throw toolError(
+          'ENTRY_NOT_FOUND',
+          `Entry not found: ${entryPath}${caseOnlyMatch ? ` (the archive has "${caseOnlyMatch}"; paths are case-sensitive)` : ''}.`,
+          'Call mdz_list_entries to inspect valid paths, then retry mdz_remove_entry with one exact archive path.',
+          caseOnlyMatch ? [caseOnlyMatch] : undefined
+        );
+      }
+      await checkEntryHash(archive, existingPath, expectedEntryHash, 'mdz_remove_entry');
+      const entryPoint = await resolveCanonicalEntrypoint(archive);
+      if (entryPoint && samePath(entryPoint, existingPath)) {
+        throw toolError(
+          'ENTRY_IS_ENTRY_POINT',
+          `${existingPath} is the archive's entry point (its main document) and can't be removed.`,
+          'Leave it in place, or replace its content with mdz_write_entry or upsert_canonical_document.'
+        );
+      }
+
+      const mutation = await mutateArchive(() => MdzArchiveCore.updateFiles(bytes, [], [existingPath]));
+      const nextBytes = new Uint8Array(await mutation.blob.arrayBuffer());
+      await fs.writeFile(archivePath, nextBytes);
+
+      return jsonResult({
+        archivePath,
+        removedPath: existingPath,
+        changedPaths: changedPathsOf(mutation, [existingPath]),
+        entryPoint: mutation.resolvedEntryPoint,
+        postWriteValidation: await postWriteValidation(nextBytes),
+      });
+    }
+
+    case 'mdz_list_entries': {
+      const archivePath = stringArg(args, 'archivePath');
+      const includeHashes = optionalBooleanArg(args, 'includeHashes') ?? false;
+      const archive = await loadArchive(archivePath);
+
+      const listed = archive
+        .listEntries()
+        .filter((entry) => !entry.isDirectory)
+        .map(({ path, isMarkdown, isImage }) => ({ path, isMarkdown, isImage }));
+      const entries = includeHashes
+        ? await Promise.all(listed.map(async (entry) => {
+            const entryBytes = await archive.readBytes(entry.path);
+            return { ...entry, bytes: entryBytes.byteLength, entryHash: hashBytes(entryBytes) };
+          }))
+        : listed;
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(entries, null, 2),
+          },
+        ],
+      };
+    }
+
+    case 'mdz_search_text': {
+      const archivePath = stringArg(args, 'archivePath');
+      const query = stringArg(args, 'query');
+      const caseSensitive = optionalBooleanArg(args, 'caseSensitive') ?? false;
+      const useRegex = optionalBooleanArg(args, 'regex') ?? false;
+      const maxResults = clampInteger(optionalNumberArg(args, 'maxResults') ?? 100, 1, 1000);
+      const archive = await loadArchive(archivePath);
+      const matches = await searchArchiveText(archive, query, {
+        caseSensitive,
+        maxResults,
+        regex: useRegex,
+      });
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                archivePath,
+                query,
+                caseSensitive,
+                regex: useRegex,
+                maxResults,
+                matchCount: matches.length,
+                truncated: matches.length >= maxResults,
+                matches,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+
+    case 'mdz_read_text': {
+      const archivePath = stringArg(args, 'archivePath');
+      const entryPath = stringArg(args, 'entryPath');
+      const archive = await loadArchive(archivePath);
+      const resolvedPath = findExistingPath(archive, entryPath);
+
+      if (!resolvedPath) {
+        throw toolError(
+          'ENTRY_NOT_FOUND',
+          `Entry not found: ${entryPath}`,
+          'Call mdz_list_entries to inspect valid paths, then retry mdz_read_text with one exact archive path.'
+        );
+      }
+
+      const text = await archive.readText(resolvedPath);
+      return {
+        content: [
+          {
+            type: 'text',
+            text,
+          },
+          {
+            // After the text, so callers reading the first block still get just the file.
+            type: 'text',
+            text: JSON.stringify({ entryPath: resolvedPath, entryHash: hashBytes(await archive.readBytes(resolvedPath)) }),
+          },
+        ],
+      };
+    }
+
+    case 'mdz_read_image': {
+      const archivePath = stringArg(args, 'archivePath');
+      const entryPath = stringArg(args, 'entryPath');
+      const archive = await loadArchive(archivePath);
+      const normalizedEntryPath = findExistingPath(archive, entryPath);
+
+      if (!normalizedEntryPath) {
+        throw toolError(
+          'ENTRY_NOT_FOUND',
+          `Entry not found: ${entryPath}`,
+          'Call mdz_list_entries to inspect valid paths, then retry mdz_read_image with a valid image path.'
+        );
+      }
+
+      const ext = normalizedEntryPath.split('.').pop()?.toLowerCase() ?? '';
+      const mimeType = MDZ_IMAGE_MIME_TYPES[ext];
+      if (!mimeType) {
+        throw toolError(
+          'ENTRY_NOT_IMAGE',
+          `Entry is not a recognized image type: ${entryPath}`,
+          'Retry mdz_read_image with a supported image path (png, jpg, jpeg, gif, webp, svg, avif, ico).'
+        );
+      }
+
+      const bytes = await archive.readBytes(normalizedEntryPath);
+      const base64 = Buffer.from(bytes).toString('base64');
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Loaded ${normalizedEntryPath} (${mimeType}, ${bytes.byteLength} bytes, entryHash ${hashBytes(bytes)}).`,
+          },
+          {
+            type: 'image',
+            data: base64,
+            mimeType,
+          },
+        ],
+      };
+    }
+
+    case 'mdz_read_markdown_embedded_images': {
+      const archivePath = stringArg(args, 'archivePath');
+      const bytes = await readArchiveBytes(archivePath);
+      const archive = await MdzArchiveCore.open(bytes);
+
+      const requestedEntryPath = optionalStringArg(args, 'entryPath');
+      const context = await resolveReadContext(archive, requestedEntryPath);
+
+      if (!archive.hasEntry(context.resolvedMarkdownPath)) {
+        throw toolError(
+          'ENTRY_NOT_FOUND',
+          `Markdown entry not found: ${context.resolvedMarkdownPath}`,
+          'Call mdz_list_entries to inspect archive paths, then retry with a valid markdown entry path.',
+          listMarkdownPaths(archive)
+        );
+      }
+
+      const markdown = await archive.readText(context.resolvedMarkdownPath);
+      const rewritten = await rewriteMarkdownImagePathsToDataUrls(archive, context.resolvedMarkdownPath, markdown);
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: rewritten,
+          },
+        ],
+      };
+    }
+
+    default:
+      throw toolError('UNKNOWN_TOOL', `Unknown tool: ${name}`, 'Retry with one of the advertised mdz_* tools.');
+  }
+}
+
+async function resolveReadContext(
+  archive: MdzArchiveCore,
+  requestedEntryPath?: string
+): Promise<ResolveContext> {
+  const markdownPaths = listMarkdownPaths(archive);
+  const canonicalEntrypointPath = await resolveCanonicalEntrypoint(archive);
+
+  if (requestedEntryPath) {
+    const requestedNormalized = MdzArchiveCore.normalizePath(requestedEntryPath);
+    const requestedPath = findExistingPath(archive, requestedNormalized);
+    if (!requestedPath || !MdzArchiveCore.isMarkdownFile(requestedPath)) {
+      throw toolError(
+        'INVALID_MARKDOWN_ENTRY_PATH',
+        `Requested markdown entry is missing or not markdown: ${requestedEntryPath}`,
+        'Retry mdz_review_document with a valid markdown path, or omit entryPath to let the server resolve manifest-first canonical markdown.',
+        markdownPaths
+      );
+    }
+
+    return {
+      requestedEntryPath: requestedPath,
+      resolvedMarkdownPath: requestedPath,
+      canonicalEntrypointPath,
+      entrypointSource: 'requested',
+      isCanonicalRead: canonicalEntrypointPath
+        ? samePath(requestedPath, canonicalEntrypointPath)
+        : false,
+      isAmbiguous: false,
+      recommendedNextAction:
+        'If you need to update canonical markdown, call upsert_canonical_document with archivePath and new content.',
+    };
+  }
+
+  if (canonicalEntrypointPath) {
+    return {
+      requestedEntryPath: null,
+      resolvedMarkdownPath: canonicalEntrypointPath,
+      canonicalEntrypointPath,
+      entrypointSource: 'manifest',
+      isCanonicalRead: true,
+      isAmbiguous: false,
+      recommendedNextAction:
+        'Call upsert_canonical_document to update canonical markdown, or use mdz_read_text for targeted non-canonical text entries.',
+    };
+  }
+
+  if (markdownPaths.length === 1) {
+    return {
+      requestedEntryPath: null,
+      resolvedMarkdownPath: markdownPaths[0],
+      canonicalEntrypointPath: null,
+      entrypointSource: 'fallback-single-markdown',
+      isCanonicalRead: false,
+      isAmbiguous: false,
+      recommendedNextAction:
+        'Set manifest.entryPoint to this markdown path for deterministic canonical behavior across tools and agents.',
+    };
+  }
+
+  if (markdownPaths.length === 0) {
+    throw toolError(
+      'NO_MARKDOWN_ENTRIES',
+      'Archive has no markdown entries to read.',
+      'Add a markdown file to the archive (for example index.md), then retry mdz_review_document.',
+      []
+    );
+  }
+
+  throw toolError(
+    'AMBIGUOUS_MARKDOWN_ENTRYPOINT',
+    'Multiple markdown entries exist and no canonical manifest entrypoint could be resolved.',
+    'Specify entryPath explicitly for this read, and set manifest.entryPoint to make future reads deterministic.',
+    markdownPaths
+  );
+}
+
+async function resolveCanonicalEntrypointForWrite(archive: MdzArchiveCore): Promise<string> {
+  const markdownPaths = listMarkdownPaths(archive);
+  const canonicalEntrypointPath = await resolveCanonicalEntrypoint(archive);
+
+  if (canonicalEntrypointPath) {
+    return canonicalEntrypointPath;
+  }
+
+  if (markdownPaths.length === 0) {
+    throw toolError(
+      'NO_MARKDOWN_ENTRIES',
+      'Cannot update canonical markdown because the archive has no markdown entries.',
+      'Add a markdown entry and set manifest.entryPoint, then retry upsert_canonical_document.'
+    );
+  }
+
+  if (markdownPaths.length > 1) {
+    throw toolError(
+      'AMBIGUOUS_CANONICAL_ENTRYPOINT',
+      'Cannot update canonical markdown because manifest.entryPoint is missing or invalid and multiple markdown entries exist.',
+      'Set manifest.entryPoint to the canonical markdown path, then retry upsert_canonical_document.',
+      markdownPaths
+    );
+  }
+
+  throw toolError(
+    'MISSING_CANONICAL_ENTRYPOINT',
+    'Cannot update canonical markdown because manifest.entryPoint is missing.',
+    `Set manifest.entryPoint to "${markdownPaths[0]}" and retry upsert_canonical_document.`,
+    markdownPaths
+  );
+}
+
+async function resolveCanonicalEntrypoint(archive: MdzArchiveCore): Promise<string | null> {
+  const manifest = await archive.readManifest();
+  const manifestEntryPoint = typeof manifest?.entryPoint === 'string' ? manifest.entryPoint.trim() : '';
+  if (!manifestEntryPoint) {
+    return null;
+  }
+
+  const normalized = MdzArchiveCore.normalizePath(manifestEntryPoint);
+  const resolvedPath = findExistingPath(archive, normalized);
+  if (!resolvedPath) {
+    return null;
+  }
+  if (!MdzArchiveCore.isMarkdownFile(resolvedPath)) {
+    return null;
+  }
+
+  return resolvedPath;
+}
+
+async function loadArchive(archivePath: string): Promise<MdzArchiveCore> {
+  const bytes = await readArchiveBytes(archivePath);
+  return MdzArchiveCore.open(bytes);
+}
+
+/** Reads an existing archive. A missing one points the agent to mdz_create_archive, not a zip script. */
+async function readArchiveBytes(archivePath: string): Promise<Buffer> {
+  try {
+    return await fs.readFile(archivePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw toolError(
+        'ARCHIVE_NOT_FOUND',
+        `No .mdz at ${archivePath} (resolved to ${path.resolve(archivePath)}).`,
+        'Check the path. To start a new .mdz, call mdz_create_archive with its files. Don\'t build one with zip tools or a script.'
+      );
+    }
+    throw error;
+  }
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function archiveExistsError(archivePath: string): MdzToolError {
+  return toolError(
+    'ARCHIVE_EXISTS',
+    `${archivePath} already exists.`,
+    'To change it, use mdz_write_entry, mdz_remove_entry or upsert_canonical_document. To replace the whole file, ask the user first, then retry mdz_create_archive with overwrite true.'
+  );
+}
+
+type NewArchiveEntry = { path: string; content: string | Uint8Array };
+
+/** The files argument of mdz_create_archive: valid, unique paths, each with exactly one content form. */
+async function createArchiveFilesArg(args: ToolArgs): Promise<NewArchiveEntry[]> {
+  const raw = args?.files;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw toolError(
+      'MISSING_FILES',
+      'files must be a non-empty list of {path, content | sourcePath | contentBase64}.',
+      'Retry mdz_create_archive with files holding at least one Markdown document, for example [{"path": "index.md", "content": "# Title\\n"}].'
+    );
+  }
+  const entries: NewArchiveEntry[] = [];
+  for (const [index, item] of raw.entries()) {
+    const record = item && typeof item === 'object' ? (item as Record<string, unknown>) : undefined;
+    const rawPath = typeof record?.path === 'string' ? record.path.trim() : '';
+    if (!record || !rawPath) {
+      throw toolError(
+        'INVALID_FILE_ITEM',
+        `files[${index}] needs a path and its content.`,
+        'Give every item in files a path plus one of content, sourcePath or contentBase64, then retry mdz_create_archive.'
+      );
+    }
+    if (samePath(MdzArchiveCore.normalizePath(rawPath), 'manifest.json')) {
+      throw toolError(
+        'MANIFEST_NOT_WRITABLE',
+        'manifest.json is written for you and can\'t be in files.',
+        'Remove it from files and set title, mode, entryPoint, description, author or language instead.'
+      );
+    }
+    const entryPath = writableEntryPath(rawPath, 'mdz_create_archive');
+    const clash = entries.find((entry) => entry.path.toLowerCase() === entryPath.toLowerCase());
+    if (clash) {
+      throw toolError(
+        'DUPLICATE_ENTRY_PATH',
+        clash.path === entryPath
+          ? `${entryPath} is in files more than once.`
+          : `${clash.path} and ${entryPath} differ only in case, which breaks on case-insensitive systems.`,
+        'Give each file one unique path, then retry mdz_create_archive.',
+        [clash.path]
+      );
+    }
+    entries.push({ path: entryPath, content: await entryContentArg(record, 'mdz_create_archive', `files[${index}] (${entryPath})`) });
+  }
+  return entries;
+}
+
+/** Root-level support files that aren't the document itself (§ entry point discovery). */
+function isSupportMarkdown(entryPath: string): boolean {
+  return ['agents.md', 'readme.md', 'license.md', 'changelog.md'].includes(entryPath.toLowerCase());
+}
+
+/** The main document of a new archive: the one named, else index.md, else the only content document. */
+function resolveCreateEntryPoint(requested: string | undefined, markdownPaths: string[]): string {
+  if (requested) {
+    const normalized = MdzArchiveCore.normalizePath(requested);
+    const match = markdownPaths.find((p) => p === normalized);
+    if (!match) {
+      throw toolError(
+        'ENTRY_POINT_NOT_FOUND',
+        `entryPoint ${requested} is not one of the Markdown files in files.`,
+        'Retry mdz_create_archive with entryPoint set to one of the Markdown paths in files, or leave it out.',
+        markdownPaths
+      );
+    }
+    return match;
+  }
+  if (markdownPaths.includes('index.md')) {
+    return 'index.md';
+  }
+  const content = markdownPaths.filter((p) => !isSupportMarkdown(p));
+  if (content.length === 1) {
+    return content[0];
+  }
+  if (markdownPaths.length === 1) {
+    return markdownPaths[0];
+  }
+  throw toolError(
+    'ENTRY_POINT_REQUIRED',
+    'files has several Markdown documents and none is index.md, so the main document is unclear.',
+    'Retry mdz_create_archive with entryPoint set to the document that should open first.',
+    markdownPaths
+  );
+}
+
+function firstHeading(markdown: string): string | undefined {
+  const match = markdown.match(/^#[ \t]+(.+?)[ \t#]*$/m);
+  return match?.[1].trim() || undefined;
+}
+
+/**
+ * The standard AGENTS.md (media/templates), inlined into the bundle at build time
+ * so the server doesn't depend on files beside it.
+ * [mdzip-mcp] Differs from mdzip-vscode, which reads the file from disk.
+ */
+async function readAgentsGuide(): Promise<string | null> {
+  return agentsGuideText || null;
+}
+
+function listMarkdownPaths(archive: MdzArchiveCore): string[] {
+  return archive
+    .listEntries()
+    .filter((entry) => !entry.isDirectory)
+    .map((entry) => entry.path)
+    .filter((entryPath) => MdzArchiveCore.isMarkdownFile(entryPath))
+    .filter((entryPath, index, values) => values.indexOf(entryPath) === index)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function findExistingPath(archive: MdzArchiveCore, archivePath: string): string | undefined {
+  const entry = archive.findEntry(archivePath);
+  if (!entry || entry.dir) {
+    return undefined;
+  }
+  return MdzArchiveCore.normalizePath(entry.name);
+}
+
+function stringArg(args: ToolArgs, key: string): string {
+  const value = args?.[key];
+  if (typeof value !== 'string' || !value.trim()) {
+    throw toolError(
+      'MISSING_REQUIRED_ARGUMENT',
+      `Missing required string argument: ${key}`,
+      `Retry the tool call and provide a non-empty string for ${key}.`
+    );
+  }
+  return value;
+}
+
+function optionalStringArg(args: ToolArgs, key: string): string | undefined {
+  const value = args?.[key];
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function optionalNumberArg(args: ToolArgs, key: string): number | undefined {
+  const value = args?.[key];
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return undefined;
+  }
+  return value;
+}
+
+function optionalBooleanArg(args: ToolArgs, key: string): boolean | undefined {
+  const value = args?.[key];
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+function hashText(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
+/** entryHash: the SHA-256 of an entry's bytes, used to guard replacements and removals. */
+function hashBytes(bytes: Uint8Array): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+function jsonResult(value: unknown): ToolResult {
+  return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
+}
+
+/** An entry path a write tool may touch: valid (§5.4), a file, and not manifest.json. */
+function writableEntryPath(rawPath: string, toolName: string): string {
+  const entryPath = MdzArchiveCore.normalizePath(rawPath.trim());
+  const problem = MdzArchiveCore.pathProblem(entryPath);
+  if (problem || entryPath.endsWith('/')) {
+    throw toolError(
+      'INVALID_ENTRY_PATH',
+      problem ? `${rawPath}: ${problem.message} (${problem.code})` : `${rawPath} is a folder, not a file.`,
+      `Retry ${toolName} with an archive-relative file path such as images/chart.png: forward slashes, no leading slash, no "..".`
+    );
+  }
+  if (samePath(entryPath, 'manifest.json')) {
+    throw toolError(
+      'MANIFEST_NOT_WRITABLE',
+      'manifest.json can\'t be written or removed with this tool.',
+      'Leave the manifest to MDZip tools; it is refreshed automatically on every write.'
+    );
+  }
+  return entryPath;
+}
+
+/**
+ * Exactly one of content (text), sourcePath (a file on disk) or contentBase64.
+ */
+async function entryContentArg(args: ToolArgs, toolName = 'mdz_write_entry', label?: string): Promise<string | Uint8Array> {
+  const text = typeof args?.content === 'string' ? args.content : undefined;
+  const sourcePath = optionalStringArg(args, 'sourcePath');
+  const base64 = optionalStringArg(args, 'contentBase64');
+  const given = [text !== undefined, sourcePath !== undefined, base64 !== undefined].filter(Boolean).length;
+  const prefix = label ? `${label}: ` : '';
+  if (given !== 1) {
+    throw toolError(
+      given === 0 ? 'MISSING_CONTENT' : 'AMBIGUOUS_CONTENT',
+      prefix + (given === 0 ? 'No content given.' : 'Give the content in only one form.'),
+      `Retry ${toolName} with exactly one of content (UTF-8 text), sourcePath (a file on disk) or contentBase64 (binary).`
+    );
+  }
+  if (text !== undefined) {
+    return text;
+  }
+  if (sourcePath !== undefined) {
+    try {
+      return new Uint8Array(await fs.readFile(sourcePath));
+    } catch (error) {
+      throw toolError(
+        'SOURCE_NOT_READABLE',
+        `${prefix}Can't read sourcePath ${sourcePath}: ${error instanceof Error ? error.message : String(error)}`,
+        `Retry ${toolName} with the absolute path of an existing file, or pass the content inline.`
+      );
+    }
+  }
+  const decoded = Buffer.from(base64 as string, 'base64');
+  if (decoded.toString('base64').replace(/=+$/, '') !== (base64 as string).replace(/\s+/g, '').replace(/=+$/, '')) {
+    throw toolError('INVALID_BASE64', `${prefix}contentBase64 is not valid base64.`, `Retry ${toolName} with standard base64, or use sourcePath for a file on disk.`);
+  }
+  return new Uint8Array(decoded);
+}
+
+/**
+ * Replacing or removing an entry requires the hash the caller last read, so a
+ * change made since (by the editor, another agent, a person) isn't silently lost.
+ * For a Markdown entry the canonicalContentHash from mdz_review_document is
+ * accepted too.
+ */
+async function checkEntryHash(
+  archive: MdzArchiveCore,
+  entryPath: string,
+  expectedEntryHash: string | undefined,
+  toolName: string
+): Promise<void> {
+  const entryBytes = await archive.readBytes(entryPath);
+  const currentHash = hashBytes(entryBytes);
+  const accepted = new Set([currentHash]);
+  if (MdzArchiveCore.isMarkdownFile(entryPath)) {
+    accepted.add(hashText(await archive.readText(entryPath)));
+  }
+  if (!expectedEntryHash) {
+    throw toolError(
+      toolName === 'mdz_write_entry' ? 'ENTRY_EXISTS' : 'MISSING_EXPECTED_ENTRY_HASH',
+      toolName === 'mdz_write_entry'
+        ? `${entryPath} already exists. Replacing it requires expectedEntryHash.`
+        : `expectedEntryHash is required to remove ${entryPath}.`,
+      `Read the file first (mdz_read_text or mdz_read_image) and check it's the one you mean, then retry ${toolName} with expectedEntryHash set to its entryHash (currently ${currentHash}).`
+    );
+  }
+  if (!accepted.has(expectedEntryHash)) {
+    throw toolError(
+      'CONTENT_CONFLICT',
+      `${entryPath} has changed since it was last read. Expected entry hash ${expectedEntryHash}, found ${currentHash}.`,
+      `Read ${entryPath} again, reconcile your change with what is there now, then retry ${toolName} with its new entryHash.`
+    );
+  }
+}
+
+/** Run a core-js mutation, turning its coded errors into tool errors with a next step. */
+async function mutateArchive<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    const code = (error as { code?: unknown }).code;
+    const message = error instanceof Error ? error.message : String(error);
+    if (code === 'ERR_ENTRYPOINT_CHANGED') {
+      throw toolError(
+        'ENTRY_POINT_WOULD_CHANGE',
+        message,
+        'This change would make a different file the archive\'s main document. Use another path (for example in a subfolder), or ask the user to change the entry point.'
+      );
+    }
+    if (typeof code === 'string' && code.startsWith('ERR_PATH')) {
+      throw toolError('INVALID_ENTRY_PATH', message, 'Retry with an archive-relative file path: forward slashes, no leading slash, no "..".');
+    }
+    throw error;
+  }
+}
+
+function changedPathsOf(mutation: { archivePaths: string[] }, paths: string[]): string[] {
+  // Every write refreshes manifest.json (§6.3), so report it as changed too.
+  return mutation.archivePaths.some((p) => samePath(p, 'manifest.json')) ? [...paths, 'manifest.json'] : paths;
+}
+
+async function postWriteValidation(bytes: Uint8Array) {
+  const validation = await MdzArchiveCore.validate(bytes);
+  // Every Markdown file, not just the entry point: an image used only by a
+  // second document is still in use, and an agent told otherwise may delete it.
+  const orphans = await MdzArchiveCore.findOrphanedAssets(bytes, { scanMode: 'all-markdown' });
+  return {
+    isValid: validation.isValid,
+    errors: validation.errors,
+    warnings: validation.warnings,
+    // Images that no document references, and references (links, images) that point at nothing.
+    orphanedAssetPaths: orphans.orphanedAssetPaths,
+    unresolvedReferences: orphans.unresolvedReferences,
+  };
+}
+
+function clampInteger(value: number, min: number, max: number): number {
+  const rounded = Math.round(value);
+  if (rounded < min) {
+    return min;
+  }
+  if (rounded > max) {
+    return max;
+  }
+  return rounded;
+}
+
+async function searchArchiveText(
+  archive: MdzArchiveCore,
+  query: string,
+  options: { caseSensitive: boolean; maxResults: number; regex: boolean }
+): Promise<SearchMatch[]> {
+  const matcher = createTextMatcher(query, options.caseSensitive, options.regex);
+  const matches: SearchMatch[] = [];
+
+  for (const entry of archive.listEntries()) {
+    if (matches.length >= options.maxResults) {
+      break;
+    }
+    if (entry.isDirectory) {
+      continue;
+    }
+
+    const entryPath = MdzArchiveCore.normalizePath(entry.path);
+    const text = await readEntryAsUtf8Text(archive, entryPath);
+    if (text === undefined) {
+      continue;
+    }
+
+    const lines = text.split(/\r\n|\r|\n/);
+    for (let index = 0; index < lines.length; index += 1) {
+      if (matches.length >= options.maxResults) {
+        break;
+      }
+
+      const columnIndex = matcher(lines[index]);
+      if (columnIndex === undefined) {
+        continue;
+      }
+
+      matches.push({
+        path: entryPath,
+        lineNumber: index + 1,
+        columnNumber: columnIndex + 1,
+        snippet: truncateSnippet(lines[index]),
+      });
+    }
+  }
+
+  return matches;
+}
+
+function createTextMatcher(
+  query: string,
+  caseSensitive: boolean,
+  regex: boolean
+): (line: string) => number | undefined {
+  if (regex) {
+    let pattern: RegExp;
+    try {
+      pattern = new RegExp(query, caseSensitive ? '' : 'i');
+    } catch (error) {
+      throw toolError(
+        'INVALID_REGEX',
+        error instanceof Error ? error.message : String(error),
+        'Retry mdz_search_text with a valid JavaScript regular expression, or set regex to false for literal text search.'
+      );
+    }
+
+    return (line) => {
+      const match = pattern.exec(line);
+      return match?.index;
+    };
+  }
+
+  const needle = caseSensitive ? query : query.toLocaleLowerCase();
+  return (line) => {
+    const haystack = caseSensitive ? line : line.toLocaleLowerCase();
+    const index = haystack.indexOf(needle);
+    return index >= 0 ? index : undefined;
+  };
+}
+
+async function readEntryAsUtf8Text(archive: MdzArchiveCore, entryPath: string): Promise<string | undefined> {
+  if (mimeTypeForImagePath(entryPath)) {
+    return undefined;
+  }
+
+  try {
+    const bytes = await archive.readBytes(entryPath);
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    if (text.includes('\u0000')) {
+      return undefined;
+    }
+    return text;
+  } catch {
+    return undefined;
+  }
+}
+
+function truncateSnippet(line: string): string {
+  const trimmed = line.trim();
+  if (trimmed.length <= 240) {
+    return trimmed;
+  }
+  return `${trimmed.slice(0, 237)}...`;
+}
+
+async function rewriteMarkdownImagePathsToDataUrls(
+  archive: MdzArchiveCore,
+  markdownPath: string,
+  markdown: string
+): Promise<string> {
+  const imagePattern = /!\[([^\]]*)\]\(([^)]+)\)/g;
+
+  const matches = Array.from(markdown.matchAll(imagePattern));
+  if (matches.length === 0) {
+    return markdown;
+  }
+
+  const replacements = new Map<string, string>();
+  for (const match of matches) {
+    const fullMatch = match[0];
+    const alt = match[1];
+    const rawTarget = (match[2] || '').trim();
+    if (!rawTarget || isExternalTarget(rawTarget)) {
+      continue;
+    }
+
+    const cleanTarget = stripQueryAndHash(stripAngleBrackets(rawTarget));
+    const normalizedImagePath = resolveImageReferencePath(archive, markdownPath, cleanTarget);
+
+    if (!normalizedImagePath) {
+      continue;
+    }
+
+    const mimeType = mimeTypeForImagePath(normalizedImagePath);
+    if (!mimeType) {
+      continue;
+    }
+    const base64 = await archive.readBase64(normalizedImagePath);
+    const dataUrl = `data:${mimeType};base64,${base64}`;
+    replacements.set(fullMatch, `![${alt}](${dataUrl})`);
+  }
+
+  let rewritten = markdown;
+  for (const [from, to] of replacements) {
+    rewritten = rewritten.split(from).join(to);
+  }
+  return rewritten;
+}
+
+// Raw HTML <img src> tags aren't part of the markdown image syntax above, but
+// authors use them for sizing/alignment control markdown can't express.
+const HTML_IMG_TAG_RE = /<img\b[^>]*\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))[^>]*>/gi;
+const HTML_IMG_ALT_RE = /\salt\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/i;
+
+async function collectReferencedImages(
+  archive: MdzArchiveCore,
+  markdownPath: string,
+  markdown: string,
+  maxImages: number
+): Promise<ReferencedImage[]> {
+  const imagePattern = /!\[([^\]]*)\]\(([^)]+)\)/g;
+  const results: ReferencedImage[] = [];
+  const seen = new Set<string>();
+
+  const candidates: Array<{ alt: string; rawTarget: string }> = [];
+  for (const match of markdown.matchAll(imagePattern)) {
+    candidates.push({ alt: match[1] || '', rawTarget: (match[2] || '').trim() });
+  }
+  for (const match of markdown.matchAll(HTML_IMG_TAG_RE)) {
+    const rawTarget = (match[1] ?? match[2] ?? match[3] ?? '').trim();
+    const altMatch = HTML_IMG_ALT_RE.exec(match[0]);
+    const alt = altMatch ? (altMatch[1] ?? altMatch[2] ?? altMatch[3] ?? '') : '';
+    candidates.push({ alt, rawTarget });
+  }
+
+  for (const { alt, rawTarget } of candidates) {
+    if (results.length >= maxImages) {
+      break;
+    }
+
+    if (!rawTarget || isExternalTarget(rawTarget)) {
+      continue;
+    }
+
+    const cleanTarget = stripQueryAndHash(stripAngleBrackets(rawTarget));
+    const normalizedPath = resolveImageReferencePath(archive, markdownPath, cleanTarget);
+    if (!normalizedPath) {
+      continue;
+    }
+    if (seen.has(normalizedPath)) {
+      continue;
+    }
+
+    const mimeType = mimeTypeForImagePath(normalizedPath);
+    if (!mimeType) {
+      continue;
+    }
+    const bytes = await archive.readBytes(normalizedPath);
+    results.push({ path: normalizedPath, mimeType, bytes, alt });
+    seen.add(normalizedPath);
+  }
+
+  return results;
+}
+
+function resolveImageReferencePath(
+  archive: MdzArchiveCore,
+  markdownPath: string,
+  target: string
+): string | undefined {
+  const normalizedTarget = target.replace(/\\/g, '/');
+  const candidates = [normalizedTarget.replace(/^\.\//, '')];
+
+  try {
+    candidates.push(MdzArchiveCore.resolvePath(markdownPath, normalizedTarget));
+  } catch {
+    // Invalid relative targets are ignored by the preview/read helpers.
+  }
+
+  for (const candidate of candidates) {
+    const resolved = findExistingPath(archive, candidate);
+    if (!resolved || !mimeTypeForImagePath(resolved)) {
+      continue;
+    }
+    return resolved;
+  }
+
+  return undefined;
+}
+
+function mimeTypeForImagePath(archivePath: string): string | undefined {
+  const ext = archivePath.split('.').pop()?.toLowerCase() ?? '';
+  return MDZ_IMAGE_MIME_TYPES[ext];
+}
+
+function stripQueryAndHash(target: string): string {
+  return target.split('?')[0].split('#')[0];
+}
+
+function stripAngleBrackets(target: string): string {
+  const match = target.match(/^<(.+)>$/);
+  return match ? match[1].trim() : target;
+}
+
+function isExternalTarget(target: string): boolean {
+  const normalized = target.replace(/\\/g, '/');
+  if (/^[a-zA-Z][a-zA-Z\d+.-]*:/.test(normalized)) {
+    return true;
+  }
+  if (normalized.startsWith('//')) {
+    return true;
+  }
+  if (normalized.startsWith('/')) {
+    return true;
+  }
+  return false;
+}
+
+function toolError(
+  code: string,
+  message: string,
+  nextAction: string,
+  candidatePaths?: string[]
+): MdzToolError {
+  return new MdzToolError({
+    code,
+    message,
+    nextAction,
+    candidatePaths,
+  });
+}
+
+export function toToolErrorResult(toolName: string, error: unknown): {
+  isError: true;
+  content: [{ type: 'text'; text: string }];
+} {
+  const payload: ToolErrorPayload =
+    error instanceof MdzToolError
+      ? error.payload
+      : {
+          code: 'INTERNAL_ERROR',
+          message: error instanceof Error ? error.message : String(error),
+          nextAction: `Retry ${toolName}. If the error persists, inspect the archive with mdz_list_entries and verify archivePath and entry paths.`,
+        };
+
+  return {
+    isError: true,
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({ error: payload }, null, 2),
+      },
+    ],
+  };
+}
