@@ -86,6 +86,6 @@ A standalone server makes the launcher unnecessary for non-VS Code clients: they
 ### Keeping the copies in step until then
 Any change to the tools in mdzip-vscode has to be repeated here, and the reverse. Note the mdzip-vscode commit each copy was taken from, so drift is easy to diff.
 
-## Still open
-- **Read-only default for the standalone server.** Suggested: ship all 10 tools, writes off unless `--allow-writes`.
-- **One package or two.** Suggested: one (`@mdzip/mcp-server`) for now.
+## Decisions
+- ~~Read-only default for the standalone server.~~ **Decided 2026-11-25: writes allowed by default**, the same as the extension. A `--read-only` flag can still be added for users who want it.
+- ~~One package or two.~~ **Decided 2026-11-25: one package, `@mdzip/mcp-server`.** If another program needs the tools without the server, expose them at `@mdzip/mcp-server/tools`; split out `@mdzip/mcp` only when that becomes necessary.
