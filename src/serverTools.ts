@@ -1,9 +1,10 @@
 import { TOOL_DEFINITIONS, handleToolCall, MdzToolError, type ToolArgs, type ToolDefinition, type ToolResult } from './mdzToolHandlers';
 import { FIND_ARCHIVES_DEFINITION, FIND_ARCHIVES_TOOL, findArchives } from './discovery';
 import { applyRoots } from './roots';
+import { LimitError, checkCallSizes } from './limits';
 
 // mdzip-mcp only: the tool set this server offers. It wraps the copied tool handlers
-// (mdzToolHandlers.ts) with mdz_find_archives, --root checks and --read-only.
+// (mdzToolHandlers.ts) with mdz_find_archives, --root, --read-only and size limits.
 
 export type ServerToolOptions = {
   roots: readonly string[];
@@ -41,6 +42,17 @@ export function listTools(options: ServerToolOptions): AnnotatedTool[] {
 }
 
 export async function callTool(name: string, args: ToolArgs, options: ServerToolOptions): Promise<ToolResult> {
+  try {
+    return await dispatch(name, args, options);
+  } catch (error) {
+    if (error instanceof LimitError) {
+      throw new MdzToolError({ code: error.code, message: error.message, nextAction: error.nextAction });
+    }
+    throw error;
+  }
+}
+
+async function dispatch(name: string, args: ToolArgs, options: ServerToolOptions): Promise<ToolResult> {
   if (options.readOnly && !READ_TOOLS.has(name)) {
     throw new MdzToolError({
       code: 'READ_ONLY',
@@ -52,5 +64,7 @@ export async function callTool(name: string, args: ToolArgs, options: ServerTool
   if (name === FIND_ARCHIVES_TOOL) {
     return findArchives(args, options.roots);
   }
-  return handleToolCall(name, await applyRoots(args, options.roots));
+  const resolved = await applyRoots(args, options.roots);
+  await checkCallSizes(name, resolved);
+  return handleToolCall(name, resolved);
 }

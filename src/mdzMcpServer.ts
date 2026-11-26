@@ -8,6 +8,7 @@ import { version } from '../package.json';
 import { CliError, USAGE, parseArgs } from './cli';
 import { resolveRoots, serverInstructions } from './roots';
 import { callTool, listTools, type ServerToolOptions } from './serverTools';
+import { configureLimits } from './limits';
 
 // [mdzip-mcp] The server is created in main(), after --root is read, so its
 // instructions can name the allowed folders.
@@ -70,6 +71,7 @@ async function main(): Promise<void> {
     process.stderr.write(`mdzip-mcp-server: ${error instanceof Error ? error.message : String(error)}\n`);
     process.exit(2);
   }
+  configureLimits(options.maxFileMb);
   const server = createServer({ roots, readOnly: options.readOnly });
   const transport = new StdioServerTransport();
   await server.connect(transport);

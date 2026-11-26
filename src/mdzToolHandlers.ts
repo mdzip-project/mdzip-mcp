@@ -3,6 +3,8 @@ import * as path from 'path';
 import { createHash } from 'crypto';
 import { MdzArchiveCore, MdzPackagerCore, MDZ_IMAGE_MIME_TYPES, samePath, type MdzPackInputFile } from '@mdzip/core-js';
 import agentsGuideText from '../media/templates/embedded-agent-guide.md';
+// [mdzip-mcp] Archives are written atomically (temp file + rename); mdzip-vscode uses fs.writeFile.
+import { writeFileAtomic } from './atomicWrite';
 
 /**
  * Shared business logic behind every mdz_ and upsert_canonical_document tool. This module is
@@ -494,7 +496,7 @@ export async function handleToolCall(name: string, args: ToolArgs): Promise<Tool
 
       const mutation = await MdzArchiveCore.addFile(bytes, canonicalEntrypointPath, content);
       const nextBytes = new Uint8Array(await mutation.blob.arrayBuffer());
-      await fs.writeFile(archivePath, nextBytes);
+      await writeFileAtomic(archivePath, nextBytes); // [mdzip-mcp]
 
       const validation = await MdzArchiveCore.validate(nextBytes);
       return {
@@ -620,7 +622,7 @@ export async function handleToolCall(name: string, args: ToolArgs): Promise<Tool
 
       await fs.mkdir(path.dirname(path.resolve(archivePath)), { recursive: true });
       try {
-        await fs.writeFile(archivePath, bytes, { flag: overwrite ? 'w' : 'wx' });
+        await writeFileAtomic(archivePath, bytes, { exclusive: !overwrite }); // [mdzip-mcp]
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
           throw archiveExistsError(archivePath);
@@ -685,7 +687,7 @@ export async function handleToolCall(name: string, args: ToolArgs): Promise<Tool
         MdzArchiveCore.updateFiles(bytes, [{ path: entryPath, content: newContent }])
       );
       const nextBytes = new Uint8Array(await mutation.blob.arrayBuffer());
-      await fs.writeFile(archivePath, nextBytes);
+      await writeFileAtomic(archivePath, nextBytes); // [mdzip-mcp]
       const written = await (await MdzArchiveCore.open(nextBytes)).readBytes(entryPath);
 
       return jsonResult({
@@ -729,7 +731,7 @@ export async function handleToolCall(name: string, args: ToolArgs): Promise<Tool
 
       const mutation = await mutateArchive(() => MdzArchiveCore.updateFiles(bytes, [], [existingPath]));
       const nextBytes = new Uint8Array(await mutation.blob.arrayBuffer());
-      await fs.writeFile(archivePath, nextBytes);
+      await writeFileAtomic(archivePath, nextBytes); // [mdzip-mcp]
 
       return jsonResult({
         archivePath,
