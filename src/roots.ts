@@ -67,15 +67,22 @@ export async function applyRoots(args: ToolArgs, roots: readonly string[]): Prom
   return next;
 }
 
-/** A sentence for the MCP initialize result, so agents know the limits before they hit them. */
-export function rootsInstructions(roots: readonly string[]): string {
-  return (
-    `This server can only use files inside these folders: ${roots.join(', ')}. ` +
-    `Relative paths resolve against ${roots[0]}.`
-  );
+/** For the MCP initialize result, so agents know the limits before they hit them. */
+export function serverInstructions(roots: readonly string[], readOnly: boolean): string | undefined {
+  const parts: string[] = [];
+  if (roots.length) {
+    parts.push(
+      `This server can only use files inside these folders: ${roots.join(', ')}. ` +
+        `Relative paths resolve against ${roots[0]}. Use mdz_find_archives to find .mdz files there.`
+    );
+  }
+  if (readOnly) {
+    parts.push('This server is read-only: it can read and search .mdz files but not change them.');
+  }
+  return parts.length ? parts.join(' ') : undefined;
 }
 
-async function checkPath(rawPath: string, label: string, roots: readonly string[]): Promise<string> {
+export async function checkPath(rawPath: string, label: string, roots: readonly string[]): Promise<string> {
   const absolute = path.resolve(roots[0], rawPath.trim());
   // Follow symlinks, so a link inside a root can't reach a file outside it.
   const real = await realpathAllowingMissing(absolute);

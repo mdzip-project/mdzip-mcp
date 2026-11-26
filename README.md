@@ -37,12 +37,17 @@ With `--root`:
 
 Without `--root`, the server can use any file the user running it can reach, and relative paths resolve against the folder the client starts it in.
 
+### Read-only
+
+Add `--read-only` to offer only the tools that read. The four write tools aren't listed, and a call to one fails with `READ_ONLY` without changing anything.
+
 Other options: `--help`, `--version`.
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
+| `mdz_find_archives` | Find `.mdz` files in a folder and its subfolders (all `--root` folders by default) |
 | `mdz_review_document` | Best first call: the main Markdown document, its images, and a content hash for safe writes |
 | `mdz_list_entries` | Every file in the archive, optionally with hashes |
 | `mdz_search_text` | Search text files in the archive (plain text or regex) |
@@ -54,21 +59,21 @@ Other options: `--help`, `--version`.
 | `mdz_write_entry` | Add or replace any file in an archive |
 | `mdz_remove_entry` | Remove a file from an archive |
 
-Write tools check a hash from your last read and refuse to overwrite changes made elsewhere.
+Write tools check a hash from your last read and refuse to overwrite changes made elsewhere. Each tool is marked read or write (`readOnlyHint`, `destructiveHint`), so clients can ask before writes.
 
-Without `--root`, the tools can read and write any `.mdz` the user running the server can reach.
+`mdz_find_archives` skips hidden folders and `node_modules`, doesn't follow links, searches 6 levels deep by default, and returns at most 100 archives by default. Without `--root` it needs a `folder`.
 
 ## Development
 
 ```sh
 npm install
 npm run typecheck
-npm test        # builds dist/mdzip-mcp-server.js, then runs the stdio smoke test and the --root tests
+npm test        # builds dist/mdzip-mcp-server.js, then runs the stdio smoke test and the mdzip-mcp-only tests
 ```
 
 ### Code shared with mdzip-vscode
 
-`src/mdzToolHandlers.ts`, `src/mdzMcpServer.ts`, `tests/mcp-smoke.cjs` and `media/templates/embedded-agent-guide.md` are **copies** of the same files in mdzip-vscode, taken from commit `a9081c4` (files last changed in `da62294`). Until a later refactor makes the extension use this package, a fix to the tools has to be made in both repos. Lines that differ on purpose are marked `[mdzip-mcp]`. Code that exists only here (`src/cli.ts`, `src/roots.ts`, `tests/roots.test.cjs`) sits in its own files, and `mdzToolHandlers.ts` stays as close to the original as possible: `--root` is checked in the server before a call reaches the handlers. To check for drift:
+`src/mdzToolHandlers.ts`, `src/mdzMcpServer.ts`, `tests/mcp-smoke.cjs` and `media/templates/embedded-agent-guide.md` are **copies** of the same files in mdzip-vscode, taken from commit `a9081c4` (files last changed in `da62294`). Until a later refactor makes the extension use this package, a fix to the tools has to be made in both repos. Lines that differ on purpose are marked `[mdzip-mcp]`. Code that exists only here sits in its own files (`src/cli.ts`, `src/roots.ts`, `src/discovery.ts`, `src/serverTools.ts` and `tests/*.test.cjs`), and `mdzToolHandlers.ts` stays as close to the original as possible: `serverTools.ts` adds `mdz_find_archives`, `--root` and `--read-only` around the copied handlers. To check for drift:
 
 ```sh
 git -C ../mdzip-vscode diff a9081c4 origin/main -- src/mdzToolHandlers.ts src/mdzMcpServer.ts tests/mcp-smoke.cjs media/templates/embedded-agent-guide.md

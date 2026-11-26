@@ -1,16 +1,18 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { TOOL_DEFINITIONS, handleToolCall, toToolErrorResult, type ToolArgs } from './mdzToolHandlers';
+import { toToolErrorResult, type ToolArgs } from './mdzToolHandlers';
 // [mdzip-mcp] Differs from mdzip-vscode, which hardcodes the version.
 import { version } from '../package.json';
-// [mdzip-mcp] Command-line options and --root folder limits; mdzip-vscode has neither.
+// [mdzip-mcp] Command-line options, --root, --read-only and mdz_find_archives; mdzip-vscode has none of them.
 import { CliError, USAGE, parseArgs } from './cli';
-import { applyRoots, resolveRoots, rootsInstructions } from './roots';
+import { resolveRoots, serverInstructions } from './roots';
+import { callTool, listTools, type ServerToolOptions } from './serverTools';
 
 // [mdzip-mcp] The server is created in main(), after --root is read, so its
 // instructions can name the allowed folders.
-function createServer(roots: string[]): Server {
+function createServer(options: ServerToolOptions): Server {
+  const instructions = serverInstructions(options.roots, options.readOnly);
   const server = new Server(
     {
       name: 'mdzip-mcp',
@@ -20,19 +22,19 @@ function createServer(roots: string[]): Server {
       capabilities: {
         tools: {},
       },
-      ...(roots.length ? { instructions: rootsInstructions(roots) } : {}),
+      ...(instructions ? { instructions } : {}),
     }
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return { tools: TOOL_DEFINITIONS };
+    return { tools: listTools(options) };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
     try {
-      return await handleToolCall(name, await applyRoots(args as ToolArgs, roots));
+      return await callTool(name, args as ToolArgs, options);
     } catch (error) {
       return toToolErrorResult(name, error);
     }
@@ -68,7 +70,7 @@ async function main(): Promise<void> {
     process.stderr.write(`mdzip-mcp-server: ${error instanceof Error ? error.message : String(error)}\n`);
     process.exit(2);
   }
-  const server = createServer(roots);
+  const server = createServer({ roots, readOnly: options.readOnly });
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

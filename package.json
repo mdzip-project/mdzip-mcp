@@ -32,7 +32,7 @@
   "scripts": {
     "build": "esbuild src/mdzMcpServer.ts --bundle --outfile=dist/mdzip-mcp-server.js --format=cjs --platform=node --target=node20 --minify --loader:.md=text --banner:js=\"#!/usr/bin/env node\"",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node tests/mcp-smoke.cjs && node --test tests/roots.test.cjs",
+    "test": "npm run build && node tests/mcp-smoke.cjs && node --test tests/roots.test.cjs tests/discovery.test.cjs tests/readonly.test.cjs",
     "prepublishOnly": "npm run typecheck && npm test"
   },
   "devDependencies": {

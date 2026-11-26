@@ -6,10 +6,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { spawnSync } = require('node:child_process');
 
-const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
-const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
-
-const SERVER = path.join(__dirname, '..', 'dist', 'mdzip-mcp-server.js');
+const { SERVER, connect, call: callOn, exists } = require('./helpers.cjs');
 
 let temp;
 let rootA;
@@ -19,28 +16,8 @@ let outsideArchive;
 let outsideImage;
 let client;
 
-async function connect(args) {
-  const transport = new StdioClientTransport({ command: process.execPath, args: [SERVER, ...args], stderr: 'pipe' });
-  transport.stderr?.on('data', () => {});
-  const next = new Client({ name: 'roots-test', version: '0' }, { capabilities: {} });
-  await next.connect(transport);
-  return next;
-}
-
-async function call(name, args) {
-  const result = await client.callTool({ name, arguments: args });
-  const text = result.content[0].text;
-  let payload;
-  try {
-    payload = JSON.parse(text);
-  } catch {
-    payload = text; // mdz_read_text returns the entry's text, not JSON.
-  }
-  return { isError: result.isError === true, payload };
-}
-
-async function exists(file) {
-  return fs.access(file).then(() => true, () => false);
+function call(name, args) {
+  return callOn(client, name, args);
 }
 
 function assertOutside(result) {

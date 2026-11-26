@@ -75,7 +75,7 @@ A standalone server makes the launcher unnecessary for non-VS Code clients: they
 1. Copy `mdzToolHandlers.ts`, `mdzMcpServer.ts`, `tests/mcp-smoke.cjs` and `media/templates/embedded-agent-guide.md` into this repo, as one package, `@mdzip/mcp-server`, with a `bin`.
 2. Fix only what breaks outside the extension: where the AGENTS.md template is loaded from, and the server's version (read it from package.json). Tool names, schemas and behaviour stay identical to the extension's, so clients see the same contract.
 3. Smoke test on Windows, macOS and Linux CI.
-4. Additions that live only in this repo, kept off by default or matching today's behaviour: `--root` folders (done 2026-11-25), `--read-only`, archive discovery, size limits, atomic writes.
+4. Additions that live only in this repo, kept off by default or matching today's behaviour: `--root` folders, `--read-only`, archive discovery (all done 2026-11-25), size limits, atomic writes.
 
 ### Later refactor (not now)
 - mdzip-vscode depends on `@mdzip/mcp-server` (`/tools` subpath) and deletes its copies; keep the LM adapter, definition provider and config writers there.
