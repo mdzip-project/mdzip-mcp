@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/mdzip-project/mdzip-mcp"
+    "url": "git+https://github.com/mdzip-project/mdzip-mcp.git"
   },
   "bugs": {
     "url": "https://github.com/mdzip-project/mdzip-mcp/issues"
