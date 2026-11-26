@@ -2,11 +2,11 @@
 
 A standalone [MCP](https://modelcontextprotocol.io/) server that lets AI tools read, search and edit MDZip (`.mdz`) documents: Markdown plus its images in one file. It runs locally over stdio and needs only Node.js 20 or later. You don't need VS Code, Obsidian or MDZip Studio.
 
-> **Status: early (0.1.0), not yet published to npm.** It offers the same tools as the MCP server bundled with the [MDZip VS Code extension](https://github.com/mdzip-project/mdzip-vscode).
+It offers the same tools as the MCP server bundled with the [MDZip VS Code extension](https://github.com/mdzip-project/mdzip-vscode), plus a tool to find archives, folder limits, a read-only mode and size limits.
 
 ## Set up a client
 
-Once the package is published, most clients take this configuration:
+Most clients take this configuration:
 
 ```json
 {
@@ -19,7 +19,7 @@ Once the package is published, most clients take this configuration:
 }
 ```
 
-Until then, build it from source (`npm install`, then `npm run build`) and use `"command": "node"` with `"args": ["<path to>/dist/mdzip-mcp-server.js"]`.
+To run a build from source instead (`npm install`, then `npm run build`), use `"command": "node"` with `"args": ["<path to>/dist/mdzip-mcp-server.js"]`.
 
 ### Limit it to folders
 
@@ -92,4 +92,4 @@ See [docs/phase-0-inventory.md](docs/phase-0-inventory.md) for the plan.
 
 ## License
 
-Apache-2.0
+Apache-2.0. The published server bundles its dependencies; their licenses are in `dist/THIRD_PARTY_NOTICES.md`.

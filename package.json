@@ -23,14 +23,16 @@
   },
   "files": [
     "dist/mdzip-mcp-server.js",
+    "dist/THIRD_PARTY_NOTICES.md",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "build": "esbuild src/mdzMcpServer.ts --bundle --outfile=dist/mdzip-mcp-server.js --format=cjs --platform=node --target=node20 --minify --loader:.md=text --banner:js=\"#!/usr/bin/env node\"",
+    "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node tests/mcp-smoke.cjs && node --test tests/atomic-write.test.cjs tests/discovery.test.cjs tests/limits.test.cjs tests/readonly.test.cjs tests/roots.test.cjs",
     "prepublishOnly": "npm run typecheck && npm test"
@@ -42,5 +44,8 @@
     "esbuild": "^0.28.0",
     "fflate": "^0.8.3",
     "typescript": "^5.9.3"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
